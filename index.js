@@ -1,3 +1,4 @@
+import express from "express";
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -8,10 +9,25 @@ import pino from "pino";
 import qrcode from "qrcode-terminal";
 
 const logger = pino({ level: "silent" });
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+let botStatus = "desconectado";
+
+app.get("/", (req, res) => {
+  res.send(`WhatsApp Bot - Estado: ${botStatus}`);
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", bot: botStatus });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor HTTP corriendo en puerto ${PORT}`);
+});
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -28,27 +44,27 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      botStatus = "esperando_qr";
       console.log("Escanea este codigo QR con WhatsApp:\n");
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "close") {
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      console.log(
-        `Conexion cerrada. Razon: ${statusCode}. Reconectando: ${shouldReconnect}`
-      );
+      botStatus = "desconectado";
+      console.log(`Conexion cerrada. Razon: ${statusCode}. Reconectando: ${shouldReconnect}`);
 
       if (shouldReconnect) {
-        startBot();
+        setTimeout(startBot, 3000);
       } else {
         console.log("Sesion cerrada. Elimina auth_info/ y vuelve a ejecutar.");
       }
     }
 
     if (connection === "open") {
+      botStatus = "conectado";
       console.log("Conectado a WhatsApp correctamente!");
     }
   });
