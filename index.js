@@ -15,162 +15,147 @@ const logger = pino({ level: "silent" });
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SEARCH_TERM = "Lipo Blue";
+const BATCH_SIZE = 20;
 
 let botStatus = "desconectado";
 let allMessages = [];
 let chatNames = {};
 let contacts = {};
-let syncDone = false;
+let globalSock = null;
+let totalResults = [];
+let processedChats = 0;
 
 app.get("/", (req, res) => {
-  res.send(`WhatsApp Bot - Estado: ${botStatus} | Mensajes: ${allMessages.length}`);
+  res.send(
+    `Bot: ${botStatus} | Msgs: ${allMessages.length} | ` +
+    `Chats: ${Object.keys(chatNames).length} | ` +
+    `Procesados: ${processedChats}/${Object.keys(chatNames).length} | ` +
+    `Coincidencias: ${totalResults.length}`
+  );
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", bot: botStatus, messages: allMessages.length, chats: Object.keys(chatNames).length });
-});
-
-app.get("/scrape", async (req, res) => {
-  if (!globalSock) return res.json({ error: "Bot no conectado" });
-  res.json({ status: "scrapeando", messages: allMessages.length });
-  doScrape();
+  res.json({
+    bot: botStatus,
+    messages: allMessages.length,
+    chats: Object.keys(chatNames).length,
+    processed: processedChats,
+    coincidencias: totalResults.length,
+  });
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor HTTP corriendo en puerto ${PORT}`);
+  console.log(`HTTP server en puerto ${PORT}`);
 });
 
-let globalSock = null;
+function extractText(msg) {
+  return (
+    msg.message?.conversation ||
+    msg.message?.extendedTextMessage?.text ||
+    msg.message?.imageMessage?.caption ||
+    msg.message?.videoMessage?.caption ||
+    ""
+  );
+}
 
-async function doScrape() {
-  console.log(`\n=== SCRAPING: BUSCANDO "${SEARCH_TERM}" ===`);
-  console.log(`Mensajes totales: ${allMessages.length}`);
-  console.log(`Chats: ${Object.keys(chatNames).length}`);
-  console.log(`Contactos: ${Object.keys(contacts).length}`);
-  botStatus = "scrapeando";
+function buildRow(msg, chatId) {
+  const chatName = chatNames[chatId] || contacts[chatId] || chatId;
+  return {
+    Chat: chatName,
+    "Es Grupo": isJidGroup(chatId) ? "Si" : "No",
+    Contacto: msg.pushName || "",
+    Numero: msg.key?.participant || chatId,
+    Mensaje: extractText(msg).substring(0, 300),
+    Fecha: msg.messageTimestamp
+      ? new Date(msg.messageTimestamp * 1000).toLocaleString("es-PE")
+      : "",
+  };
+}
 
-  const results = [];
-
-  for (const msg of allMessages) {
-    const chatId = msg.chatId || msg.key?.remoteJid || "";
-    const chatName = chatNames[chatId] || contacts[chatId] || chatId;
-    const isGroup = isJidGroup(chatId);
-
-    const text =
-      msg.message?.conversation ||
-      msg.message?.extendedTextMessage?.text ||
-      msg.message?.buttonsResponseMessage?.selectedButtonId ||
-      msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-      msg.message?.imageMessage?.caption ||
-      msg.message?.videoMessage?.caption ||
-      "";
-
-    if (!text) continue;
-
-    if (text.toLowerCase().includes(SEARCH_TERM.toLowerCase())) {
-      const pushName = msg.pushName || "";
-      const sender = msg.key?.participant || msg.key?.remoteJid || "";
-      const timestamp = msg.messageTimestamp
-        ? new Date(msg.messageTimestamp * 1000).toLocaleString("es-PE")
-        : "";
-
-      results.push({
-        Chat: chatName,
-        "Es Grupo": isGroup ? "Si" : "No",
-        "Contacto/Nombre": pushName,
-        "Numero/JID": sender,
-        Mensaje: text.substring(0, 300),
-        Fecha: timestamp,
-      });
-    }
-  }
-
-  if (results.length === 0) {
-    console.log(`Sin coincidencias exactas. Exportando todos los mensajes como referencia...`);
-    for (const msg of allMessages) {
-      const chatId = msg.chatId || msg.key?.remoteJid || "";
-      const chatName = chatNames[chatId] || contacts[chatId] || chatId;
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        "";
-      if (!text) continue;
-      results.push({
-        Chat: chatName,
-        "Es Grupo": isJidGroup(chatId) ? "Si" : "No",
-        "Contacto/Nombre": msg.pushName || "",
-        "Numero/JID": msg.key?.participant || chatId,
-        Mensaje: text.substring(0, 300),
-        Fecha: msg.messageTimestamp
-          ? new Date(msg.messageTimestamp * 1000).toLocaleString("es-PE")
-          : "",
-      });
-    }
-  }
-
+function exportExcel(results, fileName) {
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(results);
   ws["!cols"] = [
-    { wch: 30 },
-    { wch: 10 },
-    { wch: 25 },
-    { wch: 30 },
-    { wch: 60 },
-    { wch: 25 },
+    { wch: 30 }, { wch: 10 }, { wch: 25 },
+    { wch: 30 }, { wch: 60 }, { wch: 25 },
   ];
   XLSX.utils.book_append_sheet(wb, ws, "Lipo Blue");
-
-  const fileName = `lipo_blue_${new Date().toISOString().slice(0, 10)}.xlsx`;
   XLSX.writeFile(wb, fileName);
-
-  console.log(`\n=== SCRAPING COMPLETADO ===`);
-  console.log(`Coincidencias "${SEARCH_TERM}": ${results.length}`);
-  console.log(`Archivo: ${fileName}\n`);
-
-  botStatus = "conectado";
+  console.log(`Excel guardado: ${fileName} (${results.length} registros)`);
 }
 
-async function fetchAllHistory(sock) {
-  console.log("Solicitando historial de todos los chats...");
-  const chatIds = Object.keys(chatNames);
-  let fetched = 0;
+async function processBatch(sock, chatIds, batchStart) {
+  const batch = chatIds.slice(batchStart, batchStart + BATCH_SIZE);
+  if (batch.length === 0) return false;
 
-  for (const chatId of chatIds) {
-    try {
-      const msgs = allMessages.filter(m => (m.chatId || m.key?.remoteJid) === chatId);
-      if (msgs.length === 0) continue;
+  const batchEnd = Math.min(batchStart + BATCH_SIZE, chatIds.length);
+  console.log(`\n========== BATCH ${batchStart + 1}-${batchEnd} de ${chatIds.length} ==========`);
+  botStatus = `batch_${batchStart + 1}-${batchEnd}`;
 
-      const oldest = msgs.reduce((a, b) =>
+  for (let i = 0; i < batch.length; i++) {
+    const chatId = batch[i];
+    const chatName = chatNames[chatId] || chatId;
+    processedChats++;
+
+    console.log(`\n[${processedChats}/${chatIds.length}] ${chatName}`);
+
+    const existingMsgs = allMessages.filter(m => (m.chatId || m.key?.remoteJid) === chatId);
+
+    if (existingMsgs.length > 0) {
+      const oldest = existingMsgs.reduce((a, b) =>
         (a.messageTimestamp || 0) < (b.messageTimestamp || 0) ? a : b
       );
 
       if (oldest.messageTimestamp && oldest.key) {
-        await sock.fetchMessageHistory(
-          100,
-          {
-            remoteJid: chatId,
-            id: oldest.key.id,
-            fromMe: oldest.key.fromMe || false,
-          },
-          oldest.messageTimestamp * 1000
-        );
-        fetched++;
-        console.log(`  Historial solicitado: ${chatNames[chatId] || chatId} (${fetched}/${chatIds.length})`);
-        await new Promise(r => setTimeout(r, 2000));
+        try {
+          console.log(`  Solicitando historial anterior a ${new Date(oldest.messageTimestamp * 1000).toLocaleDateString("es-PE")}...`);
+          const prevCount = allMessages.length;
+
+          await sock.fetchMessageHistory(
+            100,
+            { remoteJid: chatId, id: oldest.key.id, fromMe: oldest.key.fromMe || false },
+            oldest.messageTimestamp * 1000
+          );
+
+          await new Promise(r => setTimeout(r, 3000));
+
+          const newMsgs = allMessages.length - prevCount;
+          console.log(`  +${newMsgs} mensajes nuevos descargados`);
+        } catch (e) {
+          console.log(`  Error descargando historial`);
+        }
       }
-    } catch (e) {
-      // skip
     }
+
+    const chatMsgs = allMessages.filter(m => (m.chatId || m.key?.remoteJid) === chatId);
+    let hits = 0;
+    for (const msg of chatMsgs) {
+      const text = extractText(msg);
+      if (text.toLowerCase().includes(SEARCH_TERM.toLowerCase())) {
+        totalResults.push(buildRow(msg, chatId));
+        hits++;
+      }
+    }
+    console.log(`  ${chatMsgs.length} mensajes revisados | ${hits} coincidencias`);
   }
-  console.log(`Historial solicitado de ${fetched} chats.`);
+
+  const fileName = `lipo_blue_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  exportExcel([...totalResults], fileName);
+
+  console.log(`\n===== RESUMEN PARCIAL =====`);
+  console.log(`Chats procesados: ${processedChats}/${chatIds.length}`);
+  console.log(`Total coincidencias "${SEARCH_TERM}": ${totalResults.length}`);
+  console.log(`Mensajes totales: ${allMessages.length}\n`);
+
+  return batchEnd < chatIds.length;
 }
 
 async function startBot() {
   allMessages = [];
   chatNames = {};
   contacts = {};
+  totalResults = [];
+  processedChats = 0;
 
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
   const { version } = await fetchLatestBaileysVersion();
@@ -184,98 +169,92 @@ async function startBot() {
     printQRInTerminal: false,
     logger,
     markOnlineOnConnect: false,
-    syncFullHistory: true,
-    browser: Browsers.macOS("Desktop"),
+    browser: Browsers.ubuntu("Chrome"),
   });
 
   globalSock = sock;
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       botStatus = "esperando_qr";
-      console.log("Escanea este codigo QR con WhatsApp:\n");
+      console.log("\nEscanea este QR:\n");
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const reconnect = code !== DisconnectReason.loggedOut;
       botStatus = "desconectado";
-      syncDone = false;
-      console.log(`Conexion cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
-      if (shouldReconnect) setTimeout(startBot, 3000);
+      console.log(`Conexion cerrada (${code}). Reconectando: ${reconnect}`);
+      if (reconnect) setTimeout(startBot, 3000);
     }
 
     if (connection === "open") {
       botStatus = "sincronizando";
-      console.log("Conectado a WhatsApp!");
-      console.log("Esperando 30 segundos para descargar historial completo...");
+      console.log("Conectado! Esperando historial base (20s)...");
+
       setTimeout(async () => {
-        console.log(`Mensajes recolectados: ${allMessages.length}`);
-        console.log(`Chats: ${Object.keys(chatNames).length}`);
-        syncDone = true;
+        const chatIds = Object.keys(chatNames);
+        console.log(`\nChats base: ${chatIds.length} | Mensajes: ${allMessages.length}`);
 
-        console.log("Intentando descargar mas historial de cada chat...");
-        await fetchAllHistory(sock);
+        if (chatIds.length === 0) {
+          console.log("Sin chats. Esperando mensajes nuevos...");
+          botStatus = "conectado";
+          return;
+        }
 
-        await new Promise(r => setTimeout(r, 10000));
-        console.log(`Mensajes totales despues de fetch: ${allMessages.length}`);
+        botStatus = "procesando_batches";
+        let batchStart = 0;
+        let hasMore = true;
 
-        await doScrape();
-      }, 30000);
+        while (hasMore) {
+          hasMore = await processBatch(sock, chatIds, batchStart);
+          batchStart += BATCH_SIZE;
+
+          if (hasMore) {
+            console.log("Pausa de 5 segundos antes del siguiente batch...");
+            await new Promise(r => setTimeout(r, 5000));
+          }
+        }
+
+        const finalFile = `lipo_blue_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        exportExcel([...totalResults], finalFile);
+
+        console.log(`\n========================================`);
+        console.log(`===== SCRAPING COMPLETADO =====`);
+        console.log(`Chats procesados: ${processedChats}`);
+        console.log(`Mensajes totales: ${allMessages.length}`);
+        console.log(`Coincidencias "${SEARCH_TERM}": ${totalResults.length}`);
+        console.log(`Archivo: ${finalFile}`);
+        console.log(`========================================\n`);
+
+        botStatus = "conectado";
+      }, 20000);
     }
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("messaging-history.set", ({ chats, messages, contacts: newContacts, isLatest }) => {
-    console.log(`[HISTORY] ${chats.length} chats, ${messages.length} mensajes, ${Object.keys(newContacts || {}).length} contactos`);
-    for (const chat of chats) {
-      chatNames[chat.id] = chat.name || "";
-    }
-    for (const [jid, contact] of Object.entries(newContacts || {})) {
-      contacts[jid] = contact.name || contact.notify || "";
-    }
+  sock.ev.on("messaging-history.set", ({ chats, messages, contacts: newContacts }) => {
+    console.log(`[SYNC] +${chats.length} chats, +${messages.length} msgs`);
+    for (const chat of chats) chatNames[chat.id] = chat.name || "";
+    for (const [jid, c] of Object.entries(newContacts || {})) contacts[jid] = c.name || c.notify || "";
     allMessages.push(...messages);
-    console.log(`  Total acumulado: ${allMessages.length} mensajes`);
   });
 
   sock.ev.on("chats.upsert", (chats) => {
-    for (const chat of chats) {
-      chatNames[chat.id] = chat.name || "";
-    }
+    for (const chat of chats) chatNames[chat.id] = chat.name || "";
   });
 
   sock.ev.on("contacts.upsert", (newContacts) => {
-    for (const contact of newContacts) {
-      contacts[contact.id] = contact.name || contact.notify || "";
-    }
+    for (const c of newContacts) contacts[c.id] = c.name || c.notify || "";
   });
 
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     if (type !== "notify") return;
     allMessages.push(...messages);
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
-      const from = msg.key.remoteJid;
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        "";
-      if (!text) continue;
-
-      console.log(`Mensaje de ${from}: ${text.substring(0, 60)}`);
-
-      if (text.toLowerCase() === "hola") {
-        sock.sendMessage(from, { text: "Hola! Bot conectado con Baileys." });
-      }
-      if (text.toLowerCase() === "ping") {
-        sock.sendMessage(from, { text: "Pong!" });
-      }
-    }
   });
 }
 
